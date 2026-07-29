@@ -1,77 +1,63 @@
 # yale-vpn-bastion
 
-A small, headless Yale VPN bastion for Ubuntu 24.04 on AWS.
+A tiny Yale VPN jump host for Ubuntu 24.04.
 
-It uses OpenConnect's AnyConnect protocol, a temporary headless Chrome session
-for Yale's Microsoft/Duo SSO, policy routing that keeps inbound SSH alive when
-the VPN installs a full default route, and Yale DNS for YCRC hostnames.
-
-## What it protects
-
-- Your Yale password exists only in the short-lived authentication processes.
-- Chrome runs with a profile under `/run` and is killed after the VPN cookie is
-  returned.
-- The long-running OpenConnect process receives its cookie over stdin and does
-  not inherit the Yale username or password.
-- SSH replies use the original cloud gateway even while ordinary egress uses
-  the Yale tunnel.
-
-This does not make a shared account safe. Use one Unix account and one SSH key
-per person, disable SSH passwords, and keep the cloud firewall as narrow as
-practical.
-
-## AWS
-
-Create an x86-64 Ubuntu 24.04 Lightsail instance, attach a static IPv4, and
-allow inbound TCP/22. A `/32` source rule is best for a fixed client IP. If
-several users roam between networks, TCP/22 can be public only if SSH password
-authentication is disabled and every user has a distinct public key.
-
-Then connect to the instance and run:
+## 1. Install
 
 ```bash
 git clone https://github.com/super-dainiu/yale-vpn-bastion.git
 cd yale-vpn-bastion
 sudo bash install.sh
-sudo yale-vpn connect First.Last@yale.edu
 ```
 
-Approve the Duo push. Check or stop the tunnel with:
+## 2. Connect
+
+From your computer, forward OpenConnect's browser callback:
+
+```bash
+ssh -L 29786:127.0.0.1:29786 ubuntu@BASTION_IP
+```
+
+Inside that SSH session:
+
+```bash
+sudo yale-vpn connect
+```
+
+Open the printed URL in your computer's browser, then finish Yale password and
+Duo login. The browser redirects through the SSH tunnel and the VPN starts.
 
 ```bash
 sudo yale-vpn status
 sudo yale-vpn disconnect
 ```
 
-The installer supports Ubuntu 24.04 on x86-64. It installs OpenConnect, Google
-Chrome, a matching ChromeDriver, Selenium, the management-route service, and
-the four small scripts in `lib/`.
+No Yale password, private key, browser profile, or VPN cookie is stored.
 
-## YCRC SSH
+## 3. SSH to YCRC
 
-Copy the relevant block from
-[`examples/ssh_config`](examples/ssh_config) to `~/.ssh/config`, replace the
-NetID, and create the control socket directory:
+Copy [`ssh_config`](ssh_config) to `~/.ssh/config`, replace `BASTION_IP` and
+`YOUR_NETID`, then:
 
 ```bash
 mkdir -p ~/.ssh/cm
 chmod 700 ~/.ssh ~/.ssh/cm
-ssh bouchet
+ssh yale-aws
+ssh misha
 ```
 
-Each cluster is a separate SSH server, so its first connection needs Duo.
-Later `ssh`, `scp`, and `rsync` calls to the same host reuse that host's
-ControlMaster while it remains alive.
+Each YCRC host needs Duo once. Its ControlMaster then reuses that authenticated
+connection.
 
-## Notes
+## Why SSH stays alive
 
-- Yale's current Linux user agent is
-  `AnyConnect Linux_64 4.10.07061`.
-- YCRC's internal DNS servers are configured only for `ycrc.yale.edu`.
-- A reboot preserves the SSH management policy, but Yale SSO/Duo must be run
-  again to recreate the VPN tunnel.
-- Review the scripts before using them. Browser login flows can change.
+Yale VPN installs a full default route. `yale-vpn route` keeps replies from
+port 22 on the original cloud gateway. A 5-second watchdog repairs the route
+after DHCP changes, VPN reconnects, or unattended system upgrades.
 
-## License
+The entire implementation is in two readable files:
 
-MIT
+- [`install.sh`](install.sh): packages and systemd units
+- [`yale-vpn`](yale-vpn): route, watchdog, connect, status, disconnect
+
+MIT licensed.

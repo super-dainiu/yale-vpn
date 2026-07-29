@@ -1,24 +1,25 @@
-# Replace YOUR_NETID and adjust the key path if needed.
+# Replace BASTION_IP and YOUR_NETID.
+Host yale-aws
+    HostName BASTION_IP
+    User ubuntu
+    IdentityFile ~/.ssh/id_rsa
+    IdentitiesOnly yes
+    ServerAliveInterval 60
+
 Host bouchet mccleary misha grace
     User YOUR_NETID
     IdentityFile ~/.ssh/id_rsa
     IdentitiesOnly yes
     ServerAliveInterval 60
-    ServerAliveCountMax 3
-    TCPKeepAlive yes
-    Compression yes
     ControlMaster auto
     ControlPersist yes
     ControlPath ~/.ssh/cm/%r@%h:%p
 
 Host bouchet
     HostName bouchet.ycrc.yale.edu
-
 Host mccleary
     HostName mccleary.ycrc.yale.edu
-
 Host misha
     HostName login1.misha.ycrc.yale.edu
-
 Host grace
     HostName grace.ycrc.yale.edu

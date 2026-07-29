@@ -1,92 +1,67 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ ${EUID} -ne 0 ]]; then
+[[ ${EUID} -eq 0 ]] || {
   echo "Run with sudo: sudo bash install.sh" >&2
   exit 2
-fi
-if [[ $(dpkg --print-architecture) != amd64 ]]; then
-  echo "This installer currently supports x86-64/amd64 only." >&2
-  exit 2
-fi
+}
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
 
-export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y \
-  ca-certificates \
-  curl \
-  jq \
-  nftables \
-  openconnect \
-  python3-selenium \
-  unzip
+apt-get install -y curl nftables openconnect
+install -m 0755 "$root/yale-vpn" /usr/local/sbin/yale-vpn
+ln -sfn /usr/local/sbin/yale-vpn /usr/local/sbin/yale-open-url
 
-if ! command -v google-chrome-stable >/dev/null; then
-  curl -fsSL \
-    https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    -o "$tmp/google-chrome.deb"
-  apt-get install -y "$tmp/google-chrome.deb"
-fi
+# networkd otherwise removes our policy rules during some package upgrades.
+install -d -m 0755 /etc/systemd/networkd.conf.d
+install -m 0644 /dev/stdin \
+  /etc/systemd/networkd.conf.d/90-yale-management.conf <<'EOF'
+[Network]
+ManageForeignRoutes=no
+ManageForeignRoutingPolicyRules=no
+EOF
 
-chrome_version=$(google-chrome-stable --version | awk '{print $3}')
-chrome_build=${chrome_version%.*}
-metadata_url=https://googlechromelabs.github.io/chrome-for-testing/latest-patch-versions-per-build-with-downloads.json
-driver_url=$(
-  curl -fsSL "$metadata_url" |
-    jq -r --arg build "$chrome_build" \
-      '.builds[$build].downloads.chromedriver[]? |
-       select(.platform == "linux64") | .url' |
-    head -n1
-)
-if [[ -z $driver_url || $driver_url == null ]]; then
-  echo "No ChromeDriver found for Chrome build $chrome_build." >&2
-  exit 1
-fi
-
-curl -fsSL "$driver_url" -o "$tmp/chromedriver.zip"
-unzip -q "$tmp/chromedriver.zip" -d "$tmp/chromedriver"
-install -d -o root -g root -m 0755 /usr/local/lib/yale-vpn
-install -o root -g root -m 0755 \
-  "$tmp/chromedriver/chromedriver-linux64/chromedriver" \
-  /usr/local/lib/yale-vpn/chromedriver
-
-install -o root -g root -m 0755 \
-  "$root/lib/yale-management-route" \
-  /usr/local/sbin/yale-management-route
-install -o root -g root -m 0755 \
-  "$root/lib/yale-vpn-dns" \
-  /usr/local/sbin/yale-vpn-dns
-install -o root -g root -m 0755 \
-  "$root/lib/yale-sso-browser" \
-  /usr/local/sbin/yale-sso-browser
-install -o root -g root -m 0755 \
-  "$root/lib/yale-vpn" \
-  /usr/local/sbin/yale-vpn
-
-install -d -o root -g root -m 0755 /etc/systemd/system
-install -o root -g root -m 0644 /dev/stdin \
-  /etc/systemd/system/yale-management-route.service <<'UNIT'
+install -m 0644 /dev/stdin \
+  /etc/systemd/system/yale-route.service <<'EOF'
 [Unit]
-Description=Keep cloud SSH outside the Yale VPN tunnel
+Description=Keep cloud SSH outside the Yale VPN
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/yale-management-route
-RemainAfterExit=yes
+ExecStart=/usr/local/sbin/yale-vpn route
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
+
+install -m 0644 /dev/stdin \
+  /etc/systemd/system/yale-route-watchdog.service <<'EOF'
+[Unit]
+Description=Repair the cloud SSH route after network changes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/yale-vpn watchdog
+EOF
+
+install -m 0644 /dev/stdin \
+  /etc/systemd/system/yale-route-watchdog.timer <<'EOF'
+[Unit]
+Description=Check the cloud SSH route every 30 seconds
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
 
 systemctl daemon-reload
-systemctl enable --now yale-management-route.service
+systemctl enable --now yale-route.service yale-route-watchdog.timer
 
-echo
-echo "Installed. Verify SSH key access and password hardening, then run:"
-echo "  sudo yale-vpn connect First.Last@yale.edu"
+echo "Installed. Next: sudo yale-vpn connect"
