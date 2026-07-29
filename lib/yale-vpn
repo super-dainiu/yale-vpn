@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly USER_AGENT='AnyConnect Linux_64 4.10.07061'
+readonly ENDPOINT="${YALE_VPN_ENDPOINT:-https://access.yale.edu}"
+readonly RUNTIME=/run/yale-vpn
+
+cleanup_browser() {
+  pkill -f '^/usr/bin/python3 /usr/local/sbin/yale-sso-browser ' \
+    2>/dev/null || true
+  pkill -f -- '--user-data-dir=/run/yale-vpn/sso-chromium-' \
+    2>/dev/null || true
+  rm -rf "$RUNTIME"/sso-chromium-*
+}
+
+status() {
+  echo "== OpenConnect =="
+  pgrep -a -x openconnect || echo "not running"
+  echo
+  echo "== VPN interface and routes =="
+  ip -brief -4 address show yalevpn 2>/dev/null || echo "yalevpn absent"
+  ip -4 route show | grep -E '(^default|yalevpn)' || true
+  echo
+  echo "== SSH management policy =="
+  ip -4 rule show | grep -E '(fwmark 0x66|lookup 200)' || true
+  echo
+  echo "== Public egress =="
+  curl -4fsS --max-time 10 https://checkip.amazonaws.com ||
+    echo "egress check failed"
+}
+
+disconnect() {
+  resolvectl revert yalevpn 2>/dev/null || true
+  if [[ -s "$RUNTIME/openconnect.pid" ]]; then
+    pid=$(<"$RUNTIME/openconnect.pid")
+    kill -INT "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+  fi
+  pkill -INT -x openconnect 2>/dev/null || true
+  rm -f "$RUNTIME/openconnect.pid"
+  cleanup_browser
+  /usr/local/sbin/yale-management-route
+  echo "Yale VPN disconnected; SSH management routing remains active."
+}
+
+connect() {
+  if pgrep -x openconnect >/dev/null; then
+    echo "OpenConnect is already running." >&2
+    status
+    return
+  fi
+
+  username="${1:-}"
+  [[ -n $username ]] || read -r -p "Yale email: " username
+  read -r -s -p "NetID password: " password
+  printf '\n'
+  [[ -n $password ]] || {
+    echo "Password cannot be empty." >&2
+    return 2
+  }
+
+  /usr/local/sbin/yale-management-route
+  install -d -m 0700 "$RUNTIME"
+
+  export YALE_SSO_USER="$username"
+  export YALE_SSO_PASSWORD="$password"
+  cleanup_auth() {
+    cleanup_browser
+    unset YALE_SSO_USER YALE_SSO_PASSWORD password auth COOKIE
+  }
+  trap cleanup_auth EXIT INT TERM
+
+  echo "Opening Yale SSO. Approve the Duo request when it arrives."
+  if ! auth=$(
+    openconnect \
+      --protocol=anyconnect \
+      --useragent="$USER_AGENT" \
+      --external-browser=/usr/local/sbin/yale-sso-browser \
+      --authenticate \
+      "$ENDPOINT"
+  ); then
+    echo "Yale browser authentication failed." >&2
+    return 1
+  fi
+  cleanup_browser
+  unset YALE_SSO_USER YALE_SSO_PASSWORD password
+
+  # OpenConnect documents --authenticate output as shell-quoted assignments.
+  eval "$auth"
+  unset auth
+  [[ -n ${COOKIE:-} && -n ${FINGERPRINT:-} ]] || {
+    echo "Yale did not return a usable VPN cookie." >&2
+    return 1
+  }
+  target="${CONNECT_URL:-${HOST:-}}"
+  [[ -n $target ]] || {
+    echo "Yale did not return a VPN target." >&2
+    return 1
+  }
+
+  args=(
+    --protocol=anyconnect
+    --useragent="$USER_AGENT"
+    --interface=yalevpn
+    --background
+    --pid-file="$RUNTIME/openconnect.pid"
+    --servercert="$FINGERPRINT"
+    --syslog
+    --timestamp
+    --cookie-on-stdin
+  )
+  [[ -z ${RESOLVE:-} ]] || args+=(--resolve="$RESOLVE")
+
+  printf '%s\n' "$COOKIE" |
+    openconnect "${args[@]}" "$target"
+  unset COOKIE
+  /usr/local/sbin/yale-vpn-dns
+  echo "Yale VPN connected."
+  status
+}
+
+if [[ ${EUID} -ne 0 ]]; then
+  echo "Run with sudo: sudo yale-vpn {connect|status|disconnect}" >&2
+  exit 2
+fi
+
+case "${1:-}" in
+  connect)
+    shift
+    connect "${1:-}"
+    ;;
+  status)
+    status
+    ;;
+  disconnect)
+    disconnect
+    ;;
+  *)
+    echo "usage: sudo yale-vpn {connect [First.Last@yale.edu]|status|disconnect}" >&2
+    exit 2
+    ;;
+esac

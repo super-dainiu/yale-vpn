@@ -1,0 +1,270 @@
+#!/usr/bin/python3
+"""Drive Yale's Microsoft/Duo SSO flow for OpenConnect."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+from selenium import webdriver
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException,
+    WebDriverException,
+)
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+# Remove primary credentials from the environment before Chrome is spawned.
+USER = os.environ.pop("YALE_SSO_USER", "")
+PASSWORD = os.environ.pop("YALE_SSO_PASSWORD", "")
+TIMEOUT = int(os.environ.get("YALE_SSO_TIMEOUT", "360"))
+
+
+def log(message: str) -> None:
+    print(f"[yale-sso] {message}", file=sys.stderr, flush=True)
+
+
+def usable(elements: list[WebElement]) -> list[WebElement]:
+    result = []
+    for element in elements:
+        try:
+            if element.is_displayed() and element.is_enabled():
+                result.append(element)
+        except StaleElementReferenceException:
+            pass
+    return result
+
+
+def first(driver: webdriver.Chrome, selectors: tuple[str, ...]) -> WebElement | None:
+    for selector in selectors:
+        elements = usable(driver.find_elements(By.CSS_SELECTOR, selector))
+        if elements:
+            return elements[0]
+    return None
+
+
+def body_text(driver: webdriver.Chrome) -> str:
+    try:
+        return driver.find_element(By.TAG_NAME, "body").text.casefold()
+    except (NoSuchElementException, StaleElementReferenceException):
+        return ""
+
+
+def click_text(driver: webdriver.Chrome, needles: tuple[str, ...]) -> bool:
+    elements = driver.find_elements(
+        By.CSS_SELECTOR,
+        "button, a, input[type=submit], [role=button], label",
+    )
+    for element in usable(elements):
+        try:
+            text = (
+                element.text
+                or element.get_attribute("value")
+                or element.get_attribute("aria-label")
+                or ""
+            ).strip()
+            if any(needle.casefold() in text.casefold() for needle in needles):
+                log(f"selecting {text[:80]!r}")
+                element.click()
+                return True
+        except (StaleElementReferenceException, WebDriverException):
+            pass
+    return False
+
+
+def in_default_or_frame(
+    driver: webdriver.Chrome,
+    action: callable,
+) -> bool:
+    driver.switch_to.default_content()
+    if action():
+        return True
+    for frame in driver.find_elements(By.CSS_SELECTOR, "iframe"):
+        try:
+            driver.switch_to.default_content()
+            driver.switch_to.frame(frame)
+            if action():
+                return True
+        except (StaleElementReferenceException, WebDriverException):
+            pass
+    driver.switch_to.default_content()
+    return False
+
+
+def submit(driver: webdriver.Chrome, field: WebElement) -> None:
+    button = first(
+        driver,
+        ("#idSIButton9", "input[type=submit]", "button[type=submit]", "button"),
+    )
+    if button is not None:
+        button.click()
+    else:
+        field.send_keys(Keys.ENTER)
+
+
+def authenticate(driver: webdriver.Chrome) -> None:
+    username = first(
+        driver,
+        (
+            "input[type=email]",
+            "input[autocomplete=username]",
+            "input[name=loginfmt]",
+            "input[type=text]",
+        ),
+    )
+    if username is not None:
+        log("submitting Yale identity")
+        username.clear()
+        username.send_keys(USER)
+        submit(driver, username)
+
+    password = WebDriverWait(driver, 45).until(
+        lambda d: first(
+            d,
+            ("input[type=password]", "input[autocomplete=current-password]"),
+        )
+    )
+    assert isinstance(password, WebElement)
+    log("submitting NetID password")
+    password.clear()
+    password.send_keys(PASSWORD)
+    submit(driver, password)
+
+    deadline = time.monotonic() + TIMEOUT
+    last_action: dict[str, float] = {}
+    push_logged = False
+
+    def try_action(name: str, needles: tuple[str, ...]) -> bool:
+        now = time.monotonic()
+        if now - last_action.get(name, 0) < 8:
+            return False
+        clicked = in_default_or_frame(
+            driver,
+            lambda: click_text(driver, needles),
+        )
+        if clicked:
+            last_action[name] = now
+        return clicked
+
+    while time.monotonic() < deadline:
+        if driver.current_url.startswith("http://localhost:29786/"):
+            log("OpenConnect callback reached")
+            return
+
+        driver.switch_to.default_content()
+        text = body_text(driver)
+        if "validation failure" in text:
+            raise RuntimeError("Cisco rejected or expired the SAML response")
+
+        if "pick an account" in text and USER.casefold() in text:
+            if try_action("account", (USER,)):
+                time.sleep(2)
+                continue
+
+        no_button = first(driver, ("#idBtn_Back",))
+        if "stay signed in" in text and no_button is not None:
+            log("declining persistent Microsoft sign-in")
+            no_button.click()
+            time.sleep(2)
+            continue
+
+        if try_action("external", ("approve with duo", "duo security")):
+            log("entering Duo")
+            time.sleep(2)
+            continue
+
+        if try_action(
+            "device",
+            ("no, other people use this device", "this is a shared device"),
+        ):
+            log("declining Duo device persistence")
+            time.sleep(2)
+            continue
+
+        if try_action(
+            "duo",
+            (
+                "duo push",
+                "send me a push",
+                "send a push",
+                "verify with duo",
+                "continue",
+            ),
+        ):
+            log("approve the Duo request")
+
+        current_text = body_text(driver)
+        if (
+            "check for a duo push" in current_text
+            or "sent a push" in current_text
+        ) and not push_logged:
+            log("Duo push is waiting for approval")
+            push_logged = True
+
+        driver.switch_to.default_content()
+        time.sleep(1)
+
+    raise TimeoutError("timed out waiting for the Duo/OpenConnect callback")
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} SAML_URL", file=sys.stderr)
+        return 2
+    if not USER or not PASSWORD:
+        log("missing YALE_SSO_USER or YALE_SSO_PASSWORD")
+        return 2
+
+    runtime = "/run/yale-vpn"
+    os.makedirs(runtime, mode=0o700, exist_ok=True)
+    profile = tempfile.mkdtemp(prefix="sso-chromium-", dir=runtime)
+
+    options = Options()
+    options.binary_location = "/usr/bin/google-chrome-stable"
+    for argument in (
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-sync",
+        "--incognito",
+        "--no-first-run",
+        "--password-store=basic",
+        "--window-size=1280,900",
+        f"--user-data-dir={profile}",
+    ):
+        options.add_argument(argument)
+
+    driver: webdriver.Chrome | None = None
+    try:
+        driver = webdriver.Chrome(
+            service=Service("/usr/local/lib/yale-vpn/chromedriver"),
+            options=options,
+        )
+        driver.get(sys.argv[1])
+        WebDriverWait(driver, 45).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        authenticate(driver)
+        return 0
+    except Exception as error:
+        log(f"{type(error).__name__}: {error}")
+        return 1
+    finally:
+        if driver is not None:
+            driver.quit()
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
