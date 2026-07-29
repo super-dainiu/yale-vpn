@@ -15,7 +15,7 @@ sudo bash install.sh
 From your computer, forward OpenConnect's browser callback:
 
 ```bash
-ssh -L 29786:localhost:29786 ubuntu@BASTION_IP
+ssh -L '29786:[::1]:29786' ubuntu@BASTION_IP
 ```
 
 Inside that SSH session:

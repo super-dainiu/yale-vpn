@@ -111,7 +111,7 @@ connect() {
   install -d -m 0700 "$RUNTIME"
   trap 'unlink "$RUNTIME/login-url" 2>/dev/null || true' EXIT
 
-  echo "Keep this SSH session open (tunnel: -L 29786:localhost:29786)."
+  echo "Keep this SSH session open (tunnel: -L '29786:[::1]:29786')."
   auth=$(
     openconnect \
       --protocol=anyconnect \
