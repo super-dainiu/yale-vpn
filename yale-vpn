@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+TABLE=200
+MARK=0x66
+TUN=yalevpn
+RUNTIME=/run/yale-vpn
+ENDPOINT=https://access.yale.edu
+USER_AGENT='AnyConnect Linux_64 4.10.07061'
+YALE_DNS=(172.18.190.12 172.18.190.20 172.18.190.28)
+
+cloud_network() {
+  if [[ -r $RUNTIME/cloud.env ]]; then
+    # shellcheck disable=SC1091
+    source "$RUNTIME/cloud.env"
+    if ip link show "$CLOUD_IFACE" >/dev/null 2>&1 &&
+       ip -o -4 addr show dev "$CLOUD_IFACE" |
+         grep -q " ${CLOUD_IP}/"; then
+      return
+    fi
+  fi
+
+  read -r GATEWAY CLOUD_IFACE < <(
+    ip -4 route show default |
+      awk '$1 == "default" && $2 == "via" && $4 == "dev" {
+             print $3, $5
+             exit
+           }'
+  )
+  [[ -n ${GATEWAY:-} && -n ${CLOUD_IFACE:-} ]] || return 1
+  CLOUD_IP=$(
+    ip -o -4 addr show dev "$CLOUD_IFACE" scope global |
+      awk '{sub(/\/.*/, "", $4); print $4; exit}'
+  )
+  [[ -n $CLOUD_IP ]] || return 1
+
+  install -d -m 0755 "$RUNTIME"
+  printf 'GATEWAY=%q\nCLOUD_IFACE=%q\nCLOUD_IP=%q\n' \
+    "$GATEWAY" "$CLOUD_IFACE" "$CLOUD_IP" >"$RUNTIME/cloud.env"
+}
+
+route_setup() {
+  cloud_network
+  ip route replace table "$TABLE" default via "$GATEWAY" dev "$CLOUD_IFACE"
+
+  while ip rule del priority 90 2>/dev/null; do :; done
+  while ip rule del priority 100 2>/dev/null; do :; done
+  ip rule add priority 90 fwmark "$MARK"/0xffffffff lookup "$TABLE"
+  ip rule add priority 100 from "$CLOUD_IP"/32 lookup "$TABLE"
+
+  nft delete table inet yale_management 2>/dev/null || true
+  nft -f - <<EOF
+table inet yale_management {
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "$CLOUD_IFACE" tcp dport 22 ct mark set $MARK
+  }
+  chain output {
+    type route hook output priority mangle; policy accept;
+    ct mark $MARK meta mark set ct mark
+  }
+}
+EOF
+
+  sysctl -q -w net.ipv4.conf.all.rp_filter=2
+  sysctl -q -w "net.ipv4.conf.${CLOUD_IFACE}.rp_filter=2"
+  echo "SSH route: $CLOUD_IP -> $GATEWAY dev $CLOUD_IFACE"
+}
+
+route_is_healthy() {
+  cloud_network
+  ip route show table "$TABLE" default |
+    grep -Eq "^default via ${GATEWAY//./\\.} dev ${CLOUD_IFACE}([[:space:]]|$)" &&
+    ip rule show | grep -Eq '^90:.*fwmark 0x66.*lookup 200$' &&
+    ip rule show | grep -Eq "^100:.*from ${CLOUD_IP}.*lookup 200$" &&
+    nft list table inet yale_management >/dev/null 2>&1
+}
+
+watchdog() {
+  route_is_healthy && return
+  cloud_network || return
+  logger -t yale-vpn "SSH route drift detected; repairing"
+  route_setup
+}
+
+open_url() {
+  install -d -m 0700 "$RUNTIME"
+  printf '%s\n' "$1" >"$RUNTIME/login-url"
+  chmod 0600 "$RUNTIME/login-url"
+  printf '\nOpen this URL in your computer browser:\n%s\n\n' "$1" >&2
+}
+
+vpn_dns() {
+  for _ in {1..20}; do
+    ip link show "$TUN" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+  resolvectl dns "$TUN" "${YALE_DNS[@]}"
+  resolvectl domain "$TUN" '~ycrc.yale.edu'
+  resolvectl default-route "$TUN" no
+}
+
+connect() {
+  pgrep -x openconnect >/dev/null && {
+    echo "VPN is already running"
+    status
+    return
+  }
+
+  route_setup
+  install -d -m 0700 "$RUNTIME"
+  trap 'unlink "$RUNTIME/login-url" 2>/dev/null || true' EXIT
+
+  echo "Keep this SSH session open (tunnel: -L '29786:[::1]:29786')."
+  auth=$(
+    openconnect \
+      --protocol=anyconnect \
+      --useragent="$USER_AGENT" \
+      --external-browser=/usr/local/sbin/yale-open-url \
+      --authenticate \
+      "$ENDPOINT"
+  )
+
+  # --authenticate emits shell-quoted COOKIE, HOST, FINGERPRINT and RESOLVE.
+  eval "$auth"
+  target="${CONNECT_URL:-${HOST:-}}"
+  [[ -n ${COOKIE:-} && -n ${FINGERPRINT:-} && -n $target ]]
+
+  args=(
+    --protocol=anyconnect
+    --useragent="$USER_AGENT"
+    --interface="$TUN"
+    --background
+    --pid-file="$RUNTIME/openconnect.pid"
+    --servercert="$FINGERPRINT"
+    --cookie-on-stdin
+  )
+  [[ -z ${RESOLVE:-} ]] || args+=(--resolve="$RESOLVE")
+
+  printf '%s\n' "$COOKIE" | openconnect "${args[@]}" "$target"
+  unset COOKIE auth
+  vpn_dns
+  status
+}
+
+disconnect() {
+  resolvectl revert "$TUN" 2>/dev/null || true
+  if [[ -s $RUNTIME/openconnect.pid ]]; then
+    kill -INT "$(<"$RUNTIME/openconnect.pid")" 2>/dev/null || true
+  fi
+  pkill -INT -x openconnect 2>/dev/null || true
+  unlink "$RUNTIME/openconnect.pid" 2>/dev/null || true
+  route_setup
+}
+
+status() {
+  pgrep -a -x openconnect || echo "VPN is not running"
+  ip -brief -4 address show "$TUN" 2>/dev/null || true
+  printf 'Public IP: '
+  curl -4fsS --max-time 10 https://checkip.amazonaws.com || true
+}
+
+# OpenConnect invokes this script through the yale-open-url symlink.
+if [[ ${0##*/} == yale-open-url ]]; then
+  open_url "${1:?missing SSO URL}"
+  exit
+fi
+
+[[ ${EUID} -eq 0 ]] || {
+  echo "Run with sudo" >&2
+  exit 2
+}
+
+case "${1:-}" in
+  connect) connect ;;
+  disconnect) disconnect ;;
+  status) status ;;
+  route) route_setup ;;
+  watchdog) watchdog ;;
+  *) echo "usage: sudo yale-vpn {connect|status|disconnect}" >&2; exit 2 ;;
+esac
