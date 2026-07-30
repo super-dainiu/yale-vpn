@@ -83,13 +83,6 @@ watchdog() {
   route_setup
 }
 
-open_url() {
-  install -d -m 0700 "$RUNTIME"
-  printf '%s\n' "$1" >"$RUNTIME/login-url"
-  chmod 0600 "$RUNTIME/login-url"
-  printf '\nOpen this URL in your computer browser:\n%s\n\n' "$1" >&2
-}
-
 vpn_dns() {
   for _ in {1..20}; do
     ip link show "$TUN" >/dev/null 2>&1 && break
@@ -109,17 +102,30 @@ connect() {
 
   route_setup
   install -d -m 0700 "$RUNTIME"
-  trap 'unlink "$RUNTIME/login-url" 2>/dev/null || true' EXIT
+  username="${1:-}"
+  [[ -n $username ]] || read -r -p "Yale email (First.Last@yale.edu): " username
+  read -r -s -p "NetID password: " YALE_SSO_PASSWORD
+  printf '\n'
+  [[ -n $YALE_SSO_PASSWORD ]] || {
+    echo "Password cannot be empty" >&2
+    return 2
+  }
 
-  echo "Keep this SSH session open (tunnel: -L '29786:[::1]:29786')."
-  auth=$(
+  trap 'unset YALE_SSO_PASSWORD YALE_SSO_USER auth COOKIE' EXIT
+  export YALE_SSO_USER="$username" YALE_SSO_PASSWORD
+  echo "Signing in with headless Chrome. Approve Duo if it appears."
+  if ! auth=$(
     openconnect \
       --protocol=anyconnect \
       --useragent="$USER_AGENT" \
-      --external-browser=/usr/local/sbin/yale-open-url \
+      --external-browser=/usr/local/sbin/yale-sso-browser \
       --authenticate \
       "$ENDPOINT"
-  )
+  ); then
+    echo "Yale authentication failed" >&2
+    return 1
+  fi
+  unset YALE_SSO_PASSWORD YALE_SSO_USER
 
   # --authenticate emits shell-quoted COOKIE, HOST, FINGERPRINT and RESOLVE.
   eval "$auth"
@@ -133,6 +139,8 @@ connect() {
     --background
     --pid-file="$RUNTIME/openconnect.pid"
     --servercert="$FINGERPRINT"
+    --syslog
+    --timestamp
     --cookie-on-stdin
   )
   [[ -z ${RESOLVE:-} ]] || args+=(--resolve="$RESOLVE")
@@ -160,19 +168,13 @@ status() {
   curl -4fsS --max-time 10 https://checkip.amazonaws.com || true
 }
 
-# OpenConnect invokes this script through the yale-open-url symlink.
-if [[ ${0##*/} == yale-open-url ]]; then
-  open_url "${1:?missing SSO URL}"
-  exit
-fi
-
 [[ ${EUID} -eq 0 ]] || {
   echo "Run with sudo" >&2
   exit 2
 }
 
 case "${1:-}" in
-  connect) connect ;;
+  connect) connect "${2:-}" ;;
   disconnect) disconnect ;;
   status) status ;;
   route) route_setup ;;
